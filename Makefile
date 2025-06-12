@@ -7,7 +7,7 @@ CLEANFILES = $(PROGS) *.o *.d
 SRCDIR ?= ./
 
 NO_MAN=
-CFLAGS = -O3 -pipe
+CFLAGS = -O0 -march=armv8-a -pipe
 CFLAGS += -g -rdynamic
 CFLAGS += -Werror -Wall -Wunused-function
 CFLAGS += -Wextra
@@ -28,10 +28,16 @@ C_SRCS = main.c
 OBJS = $(C_SRCS:.c=.o)
 
 .PHONY: all
-all: $(PROGS)
+all: $(PROGS) hello
 
 $(PROGS): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+hello.o: hello.c
+	$(CC) -g  -c $^
+
+hello: hello.o
+	$(CC) -o $@ $^ -L. -lzpoline -Wl,-rpath,.
 
 clean:
 	-@rm -rf $(CLEANFILES)

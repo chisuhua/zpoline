@@ -118,6 +118,74 @@ extern void asm_syscall_hook(void);
 
 void ____asm_impl(void)
 {
+#if 1 
+    asm volatile (
+		".globl enter_syscall\n\t"
+		"enter_syscall:\n\t"
+		"mov x8, x0\n\t"	// sysno
+		"mov x0, x1\n\t"	// arg1
+		"mov x1, x2\n\t"	// arg2
+		"mov x2, x3\n\t"	// arg3
+		"mov x3, x4\n\t"	// arg4
+		"mov x4, x5\n\t"	// arg5
+		"mov x5, x6\n\t"	// arg6
+        ".global syscall_addr\n\t"
+        "syscall_addr:\n\t"
+		"svc #0\n\t"		// invoke syscall
+		"ret\n\t"
+	);
+
+	asm volatile (
+		".globl asm_syscall_hook\n\t"
+		"asm_syscall_hook:\n\t"
+
+		"cmp x8, #243\n\t"	// rt_sigreturn
+		"b.eq do_rt_sigreturn\n\t"
+
+		"stp x29, x30, [sp, -16]!\n\t"
+		"mov x29, sp\n\t"
+
+		//"movz x12, #0xf\n\t"	// align stack to 16 bytes
+		//"mvn x12, x12\n\t"	// align stack to 16 bytes
+		//"and sp, sp, #0xfffffff0\n\t"	// align stack to 16 bytes
+        "mov x12, sp\n\t"
+        "lsr x12, x12, #4\n\t"
+        "lsl x12, x12, #4\n\t"
+		"mov sp, x12\n\t"	// align stack to 16 bytes
+
+		"sub sp, sp, #160\n\t"	// save 10 registers (x19–x28)
+		"stp x19, x20, [sp, #0]\n\t"
+		"stp x21, x22, [sp, #16]\n\t"
+		"stp x23, x24, [sp, #32]\n\t"
+		"stp x25, x26, [sp, #48]\n\t"
+		"stp x27, x28, [sp, #64]\n\t"
+
+		"mov x0, x8\n\t"	// sysno
+		"mov x1, x0\n\t"	// arg1
+		"mov x2, x1\n\t"	// arg2
+		"mov x3, x2\n\t"	// arg3
+		"mov x4, x3\n\t"	// arg4
+		"mov x5, x4\n\t"	// arg5
+		"mov x6, x5\n\t"	// arg6
+		"mov x7, x30\n\t"	// return address
+
+		"bl syscall_hook\n\t"
+
+		"ldp x19, x20, [sp, #0]\n\t"
+		"ldp x21, x22, [sp, #16]\n\t"
+		"ldp x23, x24, [sp, #32]\n\t"
+		"ldp x25, x26, [sp, #48]\n\t"
+		"ldp x27, x28, [sp, #64]\n\t"
+		"add sp, sp, #160\n\t"
+
+		"ldp x29, x30, [sp], #16\n\t"
+		"ret\n\t"
+
+		"do_rt_sigreturn:\n\t"
+		"add sp, sp, #136\n\t"
+		"b syscall_addr\n\t"
+	);
+#else
 	/*
 	 * enter_syscall triggers a kernel-space system call
 	 */
@@ -209,6 +277,7 @@ void ____asm_impl(void)
 	"addq $136, %rsp \n\t"
 	"jmp syscall_addr \n\t"
 	);
+#endif
 }
 
 static long (*hook_fn)(int64_t a1, int64_t a2, int64_t a3,
@@ -236,7 +305,11 @@ long syscall_hook(int64_t rdi, int64_t rsi,
 		 *
 		 * therefore, we stop the program by int3.
 		 */
+    #if 1
+		asm volatile ("brk #0");
+    #else
 		asm volatile ("int3");
+    #endif
 	}
 #endif
 	if (rax_on_stack == 435 /* __NR_clone3 */) {
@@ -273,6 +346,30 @@ static int do_rewrite(void *data, enum disassembler_style style ATTRIBUTE_UNUSED
 static int do_rewrite(void *data, const char *fmt, ...)
 #endif
 {
+#if 1
+	struct disassembly_state *s = (struct disassembly_state *) data;
+    char buf[4096];
+    va_list arg;
+    va_start(arg, fmt);
+    vsprintf(buf, fmt, arg);
+
+    if (strstr(buf, "svc")) {
+        uint8_t *ptr = (uint8_t *)((uintptr_t)s->code + s->off);
+        if ((uintptr_t)ptr != (uintptr_t)syscall_addr) {
+            uintptr_t target = (uintptr_t)asm_syscall_hook;
+            int32_t offset = (target - (uintptr_t)ptr + 4) / 4;
+            if (offset < -0x02000000 || offset > 0x01FFFFFF) {
+                printf("Error: Jump out of range for AArch64 'b' instruction\n");
+                assert(0);
+            }
+            uint32_t insn = 0x14000000 | (offset & 0x0fffffff);
+            *(uint32_t *)ptr = insn;
+            record_replaced_instruction_addr((uintptr_t)ptr);
+        }
+    }
+	va_end(arg);
+	return 0;
+#else
 	struct disassembly_state *s = (struct disassembly_state *) data;
 	char buf[4096];
 	va_list arg;
@@ -322,6 +419,7 @@ static int do_rewrite(void *data, const char *fmt, ...)
 skip:
 	va_end(arg);
 	return 0;
+#endif
 }
 
 /* find syscall and sysenter using the disassembler, and rewrite them */
@@ -336,18 +434,34 @@ static void disassemble_and_rewrite(char *code, size_t code_size, int mem_prot)
 #else
 	init_disassemble_info(&disasm_info, &s, do_rewrite);
 #endif
+#if 1
+	disasm_info.arch = bfd_arch_aarch64;
+	disasm_info.mach = bfd_arch_aarch64;
+	disasm_info.endian = BFD_ENDIAN_LITTLE;
+#else
 	disasm_info.arch = bfd_arch_i386;
 	disasm_info.mach = bfd_mach_x86_64;
+#endif
 	disasm_info.buffer = (bfd_byte *) code;
 	disasm_info.buffer_length = code_size;
 	disassemble_init_for_target(&disasm_info);
 	disassembler_ftype disasm;
+#if 1
+#if defined(DIS_ASM_VER_229) || defined(DIS_ASM_VER_239)
+	disasm = disassembler(bfd_arch_aarch64, false, bfd_mach_aarch64, NULL);
+#else
+	bfd _bfd = { .arch_info = bfd_scan_arch("aarch64"), };
+	assert(_bfd.arch_info);
+	disasm = disassembler(&_bfd);
+#endif
+#else
 #if defined(DIS_ASM_VER_229) || defined(DIS_ASM_VER_239)
 	disasm = disassembler(bfd_arch_i386, false, bfd_mach_x86_64, NULL);
 #else
 	bfd _bfd = { .arch_info = bfd_scan_arch("i386"), };
 	assert(_bfd.arch_info);
 	disasm = disassembler(&_bfd);
+#endif
 #endif
 	s.code = code;
 	while (s.off < code_size)
@@ -532,7 +646,8 @@ static void load_hook_lib(void)
 	}
 }
 
-__attribute__((constructor(0xffff))) static void __zpoline_init(void)
+//__attribute__((constructor(0xffff))) static void __zpoline_init(void)
+void __zpoline_init(void)
 {
 #ifdef SUPPLEMENTAL__REWRITTEN_ADDR_CHECK
 	assert((bm_mem = mmap(NULL, BM_SIZE,
