@@ -13,6 +13,7 @@ CFLAGS += -Werror -Wall -Wunused-function
 CFLAGS += -Wextra
 CFLAGS += -shared -fPIC
 CFLAGS += -DSUPPLEMENTAL__REWRITTEN_ADDR_CHECK
+CFLAGS += `pkg-config --cflags --libs glib-2.0`
 
 LD_VERSION = $(shell ld --version | head -1 | grep -oP '[\d\.]+' | sed 's/\.//' | sed 's/\..*//' | head -1 )
 # differentiate the code according to the library version
@@ -24,20 +25,20 @@ endif
 
 LDFLAGS += -lopcodes -ldl
 
-C_SRCS = main.c
+C_SRCS = main_aarch64.c
 OBJS = $(C_SRCS:.c=.o)
 
 .PHONY: all
 all: $(PROGS) hello
 
 $(PROGS): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lglib-2.0
 
 hello.o: hello.c
 	$(CC) -g  -c $^
 
 hello: hello.o
-	$(CC) -o $@ $^ -L. -lzpoline -Wl,-rpath,.
+	$(CC) -o $@ $^ -L. -lzpoline -Wl,-rpath,. -lglib-2.0
 
 clean:
 	-@rm -rf $(CLEANFILES)
