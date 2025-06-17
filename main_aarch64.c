@@ -98,22 +98,36 @@
 #include <sys/mman.h>
 #include <glib.h>
 
-#define CODE_BLOCK_SIZE 8
+#define CODE_BLOCK_SIZE 16
 
-#define TRAMPOLINE_POOL_SIZE (1024 * 8)  // 可支持最多 1024 个 8 字节跳板
-static uint8_t trampoline_pool[TRAMPOLINE_POOL_SIZE];
+#define TRAMPOLINE_POOL_SIZE (1024 * 16)  // 可支持最多 1024 个 8 字节跳板
+//static uint8_t trampoline_pool[TRAMPOLINE_POOL_SIZE];
+static uint8_t* trampoline_pool = NULL;
 static size_t trampoline_pool_index = 0;
+
+static bool enable_hook = true;
 
 // 全局 hook 表
 GHashTable* hook_map = NULL;
 
-// 当前正在写的 page 地址
-static void* current_page = NULL;
+// 初始化 trampoline_pool
+void init_trampoline_pool() {
+    // 使用 mmap 分配带有执行权限的内存
+    trampoline_pool = mmap(NULL,
+                           TRAMPOLINE_POOL_SIZE,
+                           PROT_READ | PROT_WRITE | PROT_EXEC,   // 关键点：添加 EXEC 权限
+                           MAP_PRIVATE | MAP_ANONYMOUS,
+                           -1, 0);
+    assert(trampoline_pool != MAP_FAILED && "mmap failed for trampoline pool");
+
+    trampoline_pool_index = 0;
+}
+
 
 // 分配跳板函数（优先从池中分配）
 void* allocate_trampoline(size_t size) {
-    assert(size <= 8);
-    if (trampoline_pool_index + 8 > TRAMPOLINE_POOL_SIZE) {
+    assert(size <= CODE_BLOCK_SIZE);
+    if (trampoline_pool_index + CODE_BLOCK_SIZE > TRAMPOLINE_POOL_SIZE) {
         // 池满后 fallback 到 mmap
         void* mem = mmap(NULL, CODE_BLOCK_SIZE,
                          PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -123,52 +137,41 @@ void* allocate_trampoline(size_t size) {
         return mem;
     }
     void* ptr = trampoline_pool + trampoline_pool_index;
-    trampoline_pool_index += 8;
+    trampoline_pool_index += CODE_BLOCK_SIZE;
+
     return ptr;
 }
 
 // 创建 code_block: 原始指令 + ret
-void create_code_block(void* block, uint32_t orig_code) {
-    ((uint32_t*)block)[0] = orig_code;  // orig_code copied from hacked 
-    ((uint32_t*)block)[1] = 0xD61F0160;  // br x11
-}
-
-// 修改当前页为可写（如果地址跨页则恢复旧页权限）
-void prepare_page_for_write(void* addr) {
-    void* page = (void*)((uintptr_t)addr & ~0xFFF);
-
-    if (current_page == page)
-        return;
-
-    // 恢复上一页权限
-    if (current_page != NULL) {
-        mprotect(current_page, 0x1000, PROT_READ | PROT_EXEC);
-    }
-
-    // 设置新页为可写
-    mprotect(page, 0x1000, PROT_READ | PROT_WRITE);
-    current_page = page;
+void create_code_block(uint32_t *block, uint32_t *orig_code) {
+    block[0] = orig_code[0];  // trampoline_in
+    block[1] = 0xD65F03C0;  //  ret
+    block[2] = orig_code[1];  // trampoline_out
+    block[3] = 0xD61F00E0;  // br x7
 }
 
 // Hook 单个地址
-void hook_address(void* addr) {
+void hook_address(uint32_t* addr) {
     // 如果已经 Hook 过，直接返回
-    if (g_hash_table_contains(hook_map, addr))
+    if (g_hash_table_contains(hook_map, addr + 2))
         return;
 
     // 拷贝原始指令（最多 4 字节）
-    uint32_t orig_code;
-    memcpy(&orig_code, addr, 4);
+    uint32_t orig_code[2];
+    //memcpy(&orig_code, addr + 1, CODE_BLOCK_SIZE - 4);
+    orig_code[0] = *(addr - 1);
+    orig_code[1] = *(addr + 1);
 
     // 分配 code block
     void* code_block = allocate_trampoline(CODE_BLOCK_SIZE);
-    create_code_block(code_block, orig_code);
+    create_code_block((uint32_t*)code_block, orig_code);
 
     // 存入 hash 表
-    g_hash_table_insert(hook_map, addr, code_block);
+    g_hash_table_insert(hook_map, addr + 2, code_block);
+    //printf("%p:%p\n", addr, code_block);
 
     // 修改当前页为可写（如果需要）
-    prepare_page_for_write(addr);
+    //prepare_page_for_write(addr);
 }
 
 #endif
@@ -200,70 +203,78 @@ void ____asm_impl(void)
     ".globl asm_syscall_hook\n\t"
     "asm_syscall_hook:\n\t"
 
+    // 保存帧指针和返回地址
+    //"stp x29, x30, [sp, -16]!\n\t"  // 保存 x29（帧指针）和 x30（返回地址）到栈
+    "mov x29, sp\n\t"                 // 设置当前栈顶为帧指针
+     
+    // 为保存寄存器分配栈空间（10 个寄存器 × 16 字节 = 160 字节）
+    "sub sp, sp, #240\n\t"
+
+    // 保存原始寄存器到栈
+    // x30 is svc retptr 
+    "stp x0, x1, [sp, #0]\n\t"
+    "stp x2, x3, [sp, #16]\n\t"
+    "stp x4, x5, [sp, #32]\n\t"
+    "stp x6, x7, [sp, #48]\n\t"
+    "stp x8, x9, [sp, #64]\n\t"
+    "stp x10, x11, [sp, #80]\n\t"
+    "stp x12, x13, [sp, #96]\n\t"
+    "stp x14, x15, [sp, #112]\n\t"
+    "stp x16, x17, [sp, #128]\n\t"
+
+    "stp x19, x20, [sp, #144]\n\t"
+    "stp x21, x22, [sp, #160]\n\t"
+    "stp x23, x24, [sp, #176]\n\t"
+    "stp x25, x26, [sp, #192]\n\t"
+    "stp x27, x28, [sp, #208]\n\t"
+
+    "mov x0, x30\n\t"       // retptr as argument
+    "mov x20, x30\n\t"       // save retptr to x20
+    "bl get_trampoline_code\n\t"
+    "mov x19, x0\n\t"       // get trampoline_block
+    "ldp x0, x1, [sp], #16\n\t"
+    "ldp x2, x3, [sp], #16\n\t"
+    "ldp x4, x5, [sp], #16\n\t"
+    "ldp x6, x7, [sp], #16\n\t"
+    "ldp x8, x9, [sp], #16\n\t"
+    "ldp x10, x11, [sp], #16\n\t"
+    "ldp x12, x13, [sp], #16\n\t"
+    "ldp x14, x15, [sp], #16\n\t"
+    "ldp x16, x17, [sp], #16\n\t"
+    "blr x19\n\t" // call trampoline_in
+    
     // 处理 rt_sigreturn 系统调用（系统调用号 243）
     //"cmp x8, #__NR_rt_sigreturn\n\t"  // 比较 x8 与 rt_sigreturn 的系统调用号
     "cmp x8, #139\n\t"  // 比较 x8 与 rt_sigreturn 的系统调用号
     "b.eq do_rt_sigreturn\n\t"        // 如果相等，跳转到 do_rt_sigreturn
 
-    // 保存帧指针和返回地址
-    //"stp x29, x30, [sp, -16]!\n\t"     // 保存 x29（帧指针）和 x30（返回地址）到栈
-    "mov x29, sp\n\t"                 // 设置当前栈顶为帧指针
-
-    // 对齐栈指针到 16 字节边界（AArch64 要求）
-    "mov x12, sp\n\t"
-    "lsr x12, x12, #4\n\t"
-    "lsl x12, x12, #4\n\t"
-    "mov sp, x12\n\t"       // align stack to 16 bytes
-    //"and sp, sp, #0xFFFFFFFFFFFFFFF0\n\t"  // 强制 16 字节对齐
-
-    // 为保存寄存器分配栈空间（10 个寄存器 × 16 字节 = 160 字节）
-    "sub sp, sp, #160\n\t"
-
-    // 保存原始寄存器到栈(用于后续传递参数)
-    // x30 is svc next addr
-    "stp x0, x1, [sp, #0]\n\t"
-    "stp x2, x3, [sp, #16]\n\t"
-    "stp x4, x5, [sp, #32]\n\t"
-
-    // 保存寄存器到栈
-    "stp x19, x20, [sp, #48]\n\t"
-    "stp x21, x22, [sp, #64]\n\t"
-    "stp x23, x24, [sp, #80]\n\t"
-    "stp x25, x26, [sp, #96]\n\t"
-    "stp x27, x28, [sp, #112]\n\t"
-    "str x30, [sp, #120]\n\t" // x30 is svc next addr
-
-    // 将系统调用参数和返回地址传递给 C 函数
+    "mov x6, x5\n\t"
+    "mov x5, x4\n\t"
+    "mov x4, x3\n\t"
+    "mov x3, x2\n\t"
+    "mov x2, x1\n\t"
+    "mov x1, x0\n\t"
     "mov x0, x8\n\t"          // 系统调用号
-    "ldr x1, [sp, #0]\n\t"
-    "ldr x2, [sp, #8]\n\t"
-    "ldr x3, [sp, #16]\n\t"
-    "ldr x4, [sp, #24]\n\t"
-    "ldr x5, [sp, #32]\n\t"
-    "ldr x6, [sp, #40]\n\t"
 
     // 调用 C 函数 syscall_hook
     "bl syscall_hook\n\t"
 
+    "mov x7, x20\n\t"
+    "add x1, x19, #8\n\t"     // trampoline_out address
     // 恢复寄存器x19 - x28
-    "ldp x19, x20, [sp, #48]\n\t"
-    "ldp x21, x22, [sp, #64]\n\t"
-    "ldp x23, x24, [sp, #80]\n\t"
-    "ldp x25, x26, [sp, #96]\n\t"
-    "ldp x27, x28, [sp, #112]\n\t"
-
-    // x11 now is svc next address
-    "ldr x11, [sp, #120]\n\t"
+    "ldp x19, x20, [sp, #0]\n\t"
+    "ldp x21, x22, [sp, #16]\n\t"
+    "ldp x23, x24, [sp, #32]\n\t"
+    "ldp x25, x26, [sp, #48]\n\t"
+    "ldp x27, x28, [sp, #64]\n\t"
 
     // 恢复栈指针
-    "add sp, sp, #160\n\t"
+    "add sp, sp, #96\n\t"
 
     // 恢复帧指针和返回地址
     "ldp x29, x30, [sp], #16\n\t"
-
-    // x1 is code_block address
     "br x1\n\t"
-    // 返回
+    // br to retptr(x7) at trampoline_out
     //"ret\n\t"
 
     // rt_sigreturn 处理
@@ -273,107 +284,57 @@ void ____asm_impl(void)
 	);
 }
 
-typedef struct {
-    long a;
-    long b;
-} ret2long;
+long get_trampoline_code(int64_t retptr) {
+	/*
+	 * retptr is the caller's address, namely.
+	 * "supposedly", it should be callq *%rax that we replaced.
+	 */
+    if (!g_hash_table_contains(hook_map, (void*)retptr)) {
+        printf("Not find hook_address %lx\n", retptr);
+	    /*
+		 * this can should a bug of the program.
+		 */
+		asm volatile ("brk #0");
+    }
+    void* codeblock_addr = g_hash_table_lookup(hook_map, (void*)retptr);
+    return (long)codeblock_addr;
+}
 
-static long (*hook_fn)(int64_t a1, int64_t a2, int64_t a3,
+long (*hook_fn)(int64_t a1, int64_t a2, int64_t a3,
 		       int64_t a4, int64_t a5, int64_t a6,
 		       int64_t a7) = enter_syscall;
 
-#if 1
-ret2long syscall_hook(
+long syscall_hook(
     int64_t x0, // rdi, 
     int64_t x1, // rsi,
     int64_t x2, // rdx, 
     int64_t x3, // __rcx __attribute__((unused)),
 	int64_t x4, // r8, 
     int64_t x5, // r9,
-	int64_t x6, // r10_on_stack /* 4th arg for syscall */,
-	int64_t x7 //  retptr
+	int64_t x6 // r10_on_stack /* 4th arg for syscall */,
 )
 {
-	/*
-	 * retptr is the caller's address, namely.
-	 * "supposedly", it should be callq *%rax that we replaced.
-	 */
-    if (g_hash_table_contains(hook_map, (void*)x7)) {
-		/*
-		 * here, we detected that the program comes here
-		 * without going through our replaced callq *%rax.
-		 *
-		 * this can should a bug of the program.
-		 *
-		 * therefore, we stop the program by int3.
-		 */
-		asm volatile ("brk #0");
-	}
-    void* codeblock_addr = g_hash_table_lookup(hook_map, (void*)x7);
 	if (x0 == __NR_clone3 ) {
-		uint64_t *ca = (uint64_t *) x1; /* struct clone_args */
-		if (ca[0] /* flags */ & CLONE_VM) {
-			ca[6] /* stack_size */ -= sizeof(uint64_t);
-			*((uint64_t *) (ca[5] /* stack */ + ca[6] /* stack_size */)) = x7; // retptr;
-		}
+		asm volatile ("brk #0");
+		//uint64_t *ca = (uint64_t *) x1; /* struct clone_args */
+		//if (ca[0] /* flags */ & CLONE_VM) {
+		//	ca[6] /* stack_size */ -= sizeof(uint64_t);
+		//	*((uint64_t *) (ca[5] /* stack */ + ca[6] /* stack_size */)) = x7; // retptr;
+		//}
 	}
 
 	if (x0 == __NR_clone) {
-		if (x1 & CLONE_VM) { // pthread creation
-			/* push return address to the stack */
-			x2 -= sizeof(uint64_t);
-			*((uint64_t *) x2) = x7; //retptr;
-		}
+		asm volatile ("brk #0");
+		//if (x1 & CLONE_VM) { // pthread creation
+		//	/* push return address to the stack */
+		//	x2 -= sizeof(uint64_t);
+		//	*((uint64_t *) x2) = x7; //retptr;
+		//}
 	}
 
 	//return hook_fn(rax_on_stack, rdi, rsi, rdx, r10_on_stack, r8, r9);
-	x0 = hook_fn(x0,             x1,  x2,  x3,  x4,          x5, x6);
-	return (ret2long){x0, (long)codeblock_addr};
+	return hook_fn(x0,             x1,  x2,  x3,  x4,          x5, x6);
 }
-#else
-long syscall_hook(int64_t rdi, int64_t rsi,
-		  int64_t rdx, int64_t __rcx __attribute__((unused)),
-		  int64_t r8, int64_t r9,
-		  int64_t r10_on_stack /* 4th arg for syscall */,
-		  int64_t rax_on_stack,
-		  int64_t retptr)
-{
-#ifdef SUPPLEMENTAL__REWRITTEN_ADDR_CHECK
-	/*
-	 * retptr is the caller's address, namely.
-	 * "supposedly", it should be callq *%rax that we replaced.
-	 */
-	if (!is_replaced_instruction_addr(retptr - 2 /* 2 is the size of syscall/sysenter */)) {
-		/*
-		 * here, we detected that the program comes here
-		 * without going through our replaced callq *%rax.
-		 *
-		 * this can should a bug of the program.
-		 *
-		 * therefore, we stop the program by int3.
-		 */
-		asm volatile ("int3");
-	}
-#endif
-	if (rax_on_stack == 435 /* __NR_clone3 */) {
-		uint64_t *ca = (uint64_t *) rdi; /* struct clone_args */
-		if (ca[0] /* flags */ & CLONE_VM) {
-			ca[6] /* stack_size */ -= sizeof(uint64_t);
-			*((uint64_t *) (ca[5] /* stack */ + ca[6] /* stack_size */)) = retptr;
-		}
-	}
-
-	if (rax_on_stack == __NR_clone) {
-		if (rdi & CLONE_VM) { // pthread creation
-			/* push return address to the stack */
-			rsi -= sizeof(uint64_t);
-			*((uint64_t *) rsi) = retptr;
-		}
-	}
-
-	return hook_fn(rax_on_stack, rdi, rsi, rdx, r10_on_stack, r8, r9);
-}
-#endif
 
 struct disassembly_state {
 	char *code;
@@ -420,16 +381,7 @@ static int do_rewrite(void *data, enum disassembler_style style ATTRIBUTE_UNUSED
 static int do_rewrite(void *data, const char *fmt, ...)
 #endif
 {
-#if 1
 	struct disassembly_state *s = (struct disassembly_state *) data;
-    //static bool is_svc = false;
-    static int print_next = 0;
-    static bool is_mov = false;
-    static bool is_mov_x8 = false;
-    static bool is_mov_x8_valid_imm = false;
-    static bool is_mov_x8_valid_reg = false;
-    static uint8_t*  mov_x8_insn_ptr = 0;
-    static int32_t syscall_id;
     char buf[4096];
     va_list arg;
     va_start(arg, fmt);
@@ -438,151 +390,47 @@ static int do_rewrite(void *data, const char *fmt, ...)
     if (is_empty_or_whitespace(buf)) {
         goto skip;
     }
-/*
-    if (is_svc_next > 0) {
-        printf("%s ", buf);
-        is_svc_next--;
-    } else if (is_svc & !strncmp(buf, "#", 1)) {
-        is_svc = false;
-        is_svc_next = 12;
-    }
-*/
 
-    if (print_next > 0) {
-        printf("%s ", buf);
-        print_next--;
-        if (print_next == 0) printf("\n");
-    }
 
-    if (!strcmp(buf, "mov")) {
-        is_mov = true;
-        is_mov_x8 = false;
-    } else if (!strcmp(buf, "ret")) {
-        is_mov_x8_valid_imm = false;
-        is_mov_x8_valid_reg = false;
-        syscall_id = -1;
-    } else if (!strncmp(buf, ",", 1)) {
-       // printf(", %s\n", buf);
-    } else {
+    // TODO: svc , op, svc sequence doesn't work
+    if (strstr(buf, "svc")) {
+        uint8_t *ptr = (uint8_t *)((uintptr_t)s->code + s->off);
+        if ((uintptr_t)ptr != (uintptr_t)syscall_addr) {
+            //is_svc = true;
+            uint32_t * svc_addr = (uint32_t*)ptr;
+            uint32_t * svc_addr_n1 = svc_addr -1;
+            //uint32_t * svc_next_addr = (uint32_t*)(ptr + 4);
+            //uint32_t * svc_next_addr2 = (uint32_t*)(ptr + 8);
+            //if (*svc_addr != 0xd4000001) {
+            //    goto skip;
+            //}
+            hook_address(svc_addr);
 
-        if (strstr(buf, "svc")) {
-            uint8_t *ptr = (uint8_t *)((uintptr_t)s->code + s->off);
-            if ((uintptr_t)ptr != (uintptr_t)syscall_addr) {
-                //is_svc = true;
-                /*
-                uintptr_t target = (uintptr_t)asm_syscall_hook;
-                int32_t offset = (target - (uintptr_t)ptr) / 4;
-                if (offset < -0x02000000 || offset > 0x01FFFFFF) {
-                    printf("Error: Jump out of range for AArch64 'b' instruction\n");
-                    assert(0);
-                }
-                */
-                //uint32_t insn = 0x14000000 | (offset & 0x0fffffff);
-                uint32_t * svc_addr = (uint32_t*)ptr;
-                uint32_t * svc_next_addr = (uint32_t*)(ptr + 4);
-                hook_address(svc_next_addr);
-
-                *(svc_addr) = 0xA9007BF0; // stp x29, x30 [sp, #-16]; 
-                *(svc_next_addr) = 0xD63F0108; // blr x8;
-                printf("svc    %x:    @%p\n", syscall_id, ptr);
-                if (-1 == syscall_id) {
-                    printf("svc again, ");
-                } else {
-                    // replaced_instruction_addr((uintptr_t)ptr, syscall_id, mov_x8_insn_ptr, is_mov_x8_valid_imm, is_mov_x8_valid_reg);
-                }
-                if (!is_mov_x8_valid_imm & !is_mov_x8_valid_reg) {
-                    printf("no valid mov x8 before svc");
-                }
-                printf("\n");
-                //syscall_id = -1;
-                is_mov_x8 = false;
+            //printf("svc %s   %x@%p, %p\n", buf, *svc_addr, ptr, svc_next_addr);
+            //*(svc_addr) = 0xd4000001; // stp x29, x30 [sp, #-16]; 
+            //*(svc_addr) = 0xA9BF7BFD; // stp x29, x30 [sp, #-16]; 
+            if (enable_hook) {
+                svc_addr_n1[0] = 0xA9BF7BFD; // stp x29, x30 [sp, #-16]!; 
+                //svc_addr[0] = 0xD37EF51D; // lsl x29, x8, #2;  // x7 is zero: TODO is it true?
+                svc_addr[0] = 0xD280009D; // movk x29, #4;  // x7 is zero: TODO is it true?
+                svc_addr[1] = 0xD63F03A0; // blr x29;  // x7 is zero: TODO is it true?
             }
-        } else if (is_mov & (!strcmp(buf, "x8") | !strcmp(buf, "w8"))) {
-            is_mov_x8 = true;
-            is_mov_x8_valid_imm = false;
-            is_mov_x8_valid_reg = false;
-            //printf("mov %s %x@%p\n", buf, insn, ptr);
-        } else if (is_mov_x8) {
-            if (!strncmp(buf, "#", 1)) {
-                uint8_t *ptr = (uint8_t *)((uintptr_t)s->code + s->off);
-                uint32_t insn = *(uint32_t*)ptr;
-                mov_x8_insn_ptr = ptr;
-                syscall_id = -1;
-                sscanf(buf, "%*[^0x]%x", &syscall_id);
-                printf("mov x8 %x: %x@%p %s\n", syscall_id, insn, mov_x8_insn_ptr, buf);
-                is_mov_x8_valid_imm = true;
-                print_next = 12;
-            } else if (!strncmp(buf, "x", 1) | !strncmp(buf, "w", 1)) {
-                char prefix;
-                uint8_t *ptr = (uint8_t *)((uintptr_t)s->code + s->off);
-                uint32_t insn = *(uint32_t*)ptr;
-                mov_x8_insn_ptr = ptr;
-                syscall_id = -1;
-                sscanf(buf, "%c%d", &prefix, &syscall_id);
-                printf("mov x|w8 x|w%x: %x@%p %s\n", syscall_id, insn, mov_x8_insn_ptr, buf);
-                is_mov_x8_valid_reg = true;
-            } else {
-                is_mov_x8_valid_imm = false;
-                is_mov_x8_valid_reg = false;
-            }
-            is_mov_x8 = false;
         }
-        is_mov = false;
     }
+    /*
+    if ((!strncmp(buf, "m", 1) | !strncmp(buf, "a", 1) | !strncmp(buf, "b", 1) |
+        !strncmp(buf, "s", 1) | !strncmp(buf, "c", 1) | !strncmp(buf, "l", 1) |
+        !strncmp(buf, "nop", 3))) // & strncmp(buf, "sp", 2) 
+    {
+        printf("\n");
+    } else {
+        printf(" ");
+    }
+    printf("%s", buf);
+    */
 skip:
 	va_end(arg);
 	return 0;
-#else
-	struct disassembly_state *s = (struct disassembly_state *) data;
-	char buf[4096];
-	va_list arg;
-	va_start(arg, fmt);
-	vsprintf(buf, fmt, arg);
-	if (strstr(buf, "(%rsp)") && !strncmp(buf, "-", 1)) {
-		int32_t off;
-		sscanf(buf, "%x(%%rsp)", &off);
-		if (-0x78 > off && off >= -0x80) {
-			printf("\x1b[41mthis cannot be handled: %s\x1b[39m\n", buf);
-			assert(0);
-		} else if (off < -0x80) {
-			/* this is skipped */
-		} else {
-			off &= 0xff;
-			{
-				uint8_t *ptr = (uint8_t *)(((uintptr_t) s->code) + s->off);
-				{
-					int i;
-					for (i = 0; i < 16; i++) {
-						if (ptr[i] == 0x24 && ptr[i + 1] == off) {
-							ptr[i + 1] -= 8;
-							break;
-						}
-					}
-				}
-			}
-		}
-	} else
-	/* replace syscall and sysenter with callq *%rax */
-	if (!strncmp(buf, "syscall", 7) || !strncmp(buf, "sysenter", 8)) {
-		uint8_t *ptr = (uint8_t *)(((uintptr_t) s->code) + s->off);
-		if ((uintptr_t) ptr == (uintptr_t) syscall_addr) {
-			/*
-			 * skip the syscall replacement for
-			 * our system call hook (enter_syscall)
-			 * so that it can issue system calls.
-			 */
-			goto skip;
-		}
-		ptr[0] = 0xff; // callq
-		ptr[1] = 0xd0; // *%rax
-#ifdef SUPPLEMENTAL__REWRITTEN_ADDR_CHECK
-		record_replaced_instruction_addr((uintptr_t) ptr);
-#endif
-	}
-skip:
-	va_end(arg);
-	return 0;
-#endif
 }
 
 /* find syscall and sysenter using the disassembler, and rewrite them */
@@ -597,34 +445,19 @@ static void disassemble_and_rewrite(char *code, size_t code_size, int mem_prot)
 #else
 	init_disassemble_info(&disasm_info, &s, do_rewrite);
 #endif
-#if 1
 	disasm_info.arch = bfd_arch_aarch64;
 	disasm_info.mach = bfd_arch_aarch64;
 	disasm_info.endian = BFD_ENDIAN_LITTLE;
-#else
-	disasm_info.arch = bfd_arch_i386;
-	disasm_info.mach = bfd_mach_x86_64;
-#endif
 	disasm_info.buffer = (bfd_byte *) code;
 	disasm_info.buffer_length = code_size;
 	disassemble_init_for_target(&disasm_info);
 	disassembler_ftype disasm;
-#if 1
 #if defined(DIS_ASM_VER_229) || defined(DIS_ASM_VER_239)
 	disasm = disassembler(bfd_arch_aarch64, false, bfd_mach_aarch64, NULL);
 #else
 	bfd _bfd = { .arch_info = bfd_scan_arch("aarch64"), };
 	assert(_bfd.arch_info);
 	disasm = disassembler(&_bfd);
-#endif
-#else
-#if defined(DIS_ASM_VER_229) || defined(DIS_ASM_VER_239)
-	disasm = disassembler(bfd_arch_i386, false, bfd_mach_x86_64, NULL);
-#else
-	bfd _bfd = { .arch_info = bfd_scan_arch("i386"), };
-	assert(_bfd.arch_info);
-	disasm = disassembler(&_bfd);
-#endif
 #endif
 	s.code = code;
 	while (s.off < code_size)
@@ -718,6 +551,8 @@ static void setup_trampoline(void)
             exit(EXIT_FAILURE);
         }
     }
+    init_trampoline_pool();
+
 	void *mem;
 
 	/* allocate memory at virtual address 0 */
@@ -745,28 +580,26 @@ static void setup_trampoline(void)
 	 *   ldr x11, =asm_syscall_hook
 	 *   br x11
 	 */
-
 	// sub sp, sp, #0x80
-	((uint32_t *)mem)[NR_syscalls + 0] = 0xd10203ff; // sub sp, sp, #0x80
 
 	uint64_t hook_addr = (uint64_t)asm_syscall_hook;
 
-	// movz x11, #lower_16_bits(hook_addr)
-	((uint32_t *)mem)[NR_syscalls + 1] = 0x52800000 | ((hook_addr & 0xffff) << 5);
+	// sub sp, sp, #0x80
+	//((uint32_t *)mem)[NR_syscalls + 0] = 0xd10203ff; // sub sp, sp, #0x80
+	// movz x29, #lower_16_bits(hook_addr)
+	((uint32_t *)mem)[NR_syscalls + 0] = 0xd2800000 | ((hook_addr & 0xffff) << 5) | 29;
+	// movk x29, #higher16, lsl #16
+	((uint32_t *)mem)[NR_syscalls + 1] = 0xf2a00000 | (((hook_addr >> 16) & 0xffff) << 5) | 29;
+	// movk x29, #higher16, lsl #32
+	((uint32_t *)mem)[NR_syscalls + 2] = 0xf2c00000 | (((hook_addr >> 32) & 0xffff) << 5) | 29;
+	// movk x29, #highest16, lsl #48
+	((uint32_t *)mem)[NR_syscalls + 3] = 0xf2e00000 | (((hook_addr >> 48) & 0xffff) << 5) | 29;
 
-	// movk x11, #higher16, lsl #16
-	((uint32_t *)mem)[NR_syscalls + 2] = 0xf2a00000 | (((hook_addr >> 16) & 0xffff) << 5) | ((hook_addr >> 32) & 0xffff);
-
-	// movk x11, #higher16, lsl #32
-	((uint32_t *)mem)[NR_syscalls + 3] = 0xf2c00000 | ((((hook_addr >> 32) >> 16) & 0xffff) << 5) | ((hook_addr >> 48) & 0xffff);
-
-	// movk x11, #highest16, lsl #48
-	((uint32_t *)mem)[NR_syscalls + 4] = 0xf2e00000 | ((((hook_addr >> 48) >> 16) & 0xffff) << 5);
-
-	// br x11
-	((uint32_t *)mem)[NR_syscalls + 5] = 0xd61f0160;
+	// br x29
+	((uint32_t *)mem)[NR_syscalls + 4] = 0xd61f03a0;
 
 	// Calculate offset for branch instructions
+    /*
 	uintptr_t trampoline_start = (uintptr_t)mem + NR_syscalls * sizeof(uint32_t);
 	uintptr_t trampoline_code_start = trampoline_start + 1 * sizeof(uint32_t); // skip first slot
 	uintptr_t trampoline_code_end = trampoline_code_start + 5 * sizeof(uint32_t); // 5 instructions
@@ -775,6 +608,7 @@ static void setup_trampoline(void)
 	// Patch some syscall slots with branch instruction
 	((uint32_t *)mem)[214] = 0x14000000 | (offset & 0x03ffffff); // b offset
 	((uint32_t *)mem)[215] = 0x14000000 | (offset & 0x03ffffff); // b offset
+     */
 
 	/* Set memory to execute-only using mprotect if supported */
 	assert(!mprotect(mem, 0x1000, PROT_EXEC));
@@ -806,7 +640,7 @@ static void load_hook_lib(void)
 	}
 }
 
-//__attribute__((constructor(0xffff))) static void __zpoline_init(void)
+__attribute__((constructor(0xffff))) static void __zpoline_init(void);
 void __zpoline_init(void)
 {
 	setup_trampoline();
