@@ -29,7 +29,7 @@ C_SRCS = main_aarch64.c
 OBJS = $(C_SRCS:.c=.o)
 
 .PHONY: all
-all: $(PROGS) hello
+all: $(PROGS) hello libtestdl.so
 
 $(PROGS): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lglib-2.0
@@ -39,6 +39,10 @@ hello.o: hello.c
 
 hello: hello.o
 	$(CC) -o $@ $^ -L. -lzpoline -Wl,-rpath,. -lglib-2.0
+
+libtestdl.so: testdl.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 
 clean:
 	-@rm -rf $(CLEANFILES)
